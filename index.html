@@ -5,12 +5,10 @@
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
   <title>Polkadot Latest Block Dashboard</title>
   <style>
-    :root {
-      --bg:#0b1020; --panel:#131b38; --text:#e9eeff; --muted:#9aa8cc; --line:#2a3561; --accent:#7fb3ff;
-    }
-    html[data-theme='light'] { --bg:#f6f8ff; --panel:#ffffff; --text:#18213f; --muted:#5d6b93; --line:#d6def7; --accent:#295ce6; }
+    :root { --bg:#0b1020; --panel:#131b38; --text:#e9eeff; --muted:#9aa8cc; --line:#2a3561; --accent:#7fb3ff; }
+    html[data-theme='light'] { --bg:#f6f8ff; --panel:#fff; --text:#18213f; --muted:#5d6b93; --line:#d6def7; --accent:#295ce6; }
     body{margin:0;font-family:Inter,system-ui,sans-serif;background:var(--bg);color:var(--text)}
-    .wrap{max-width:980px;margin:0 auto;padding:20px}
+    .wrap{max-width:1040px;margin:0 auto;padding:20px}
     .top{display:flex;justify-content:space-between;align-items:center;gap:10px;flex-wrap:wrap}
     .card{background:var(--panel);border:1px solid var(--line);border-radius:12px;padding:14px;margin-top:12px}
     .muted{color:var(--muted)}
@@ -18,6 +16,7 @@
     table{width:100%;border-collapse:collapse;font-size:.92rem}
     th,td{border-bottom:1px solid var(--line);padding:8px;text-align:left;vertical-align:top}
     .pill{display:inline-block;padding:3px 8px;border-radius:999px;border:1px solid var(--line);font-size:.8rem}
+    .ok{color:#5fe08a}.bad{color:#ff8b8b}
   </style>
 </head>
 <body>
@@ -31,11 +30,12 @@
     </div>
 
     <section class="card">
-      <div class="muted">Latest Block</div>
+      <div class="muted">Latest Finalized Block</div>
       <h2 id="blockNumber" style="margin:6px 0">-</h2>
       <div>Hash: <span id="blockHash" class="muted">-</span></div>
       <div>Parent: <span id="parentHash" class="muted">-</span></div>
       <div>Time: <span id="updated" class="muted">-</span></div>
+      <div>Status: <span id="status" class="muted">Connecting...</span></div>
     </section>
 
     <section class="card">
@@ -52,59 +52,85 @@
     </section>
   </main>
 
-  <script>
-    const API = 'https://rpc.polkadot.io';
-    const cdEl = document.getElementById('countdown');
-    let left = 30;
+  <script type="module">
+    import { ApiPromise, WsProvider } from 'https://cdn.jsdelivr.net/npm/@polkadot/api@13.5.7/+esm';
 
-    const sleep = (ms)=>new Promise(r=>setTimeout(r,ms));
-    async function rpc(method, params=[]) {
-      const res = await fetch(API, {method:'POST',headers:{'content-type':'application/json'},body:JSON.stringify({id:1,jsonrpc:'2.0',method,params})});
-      const j = await res.json();
-      if (j.error) throw new Error(j.error.message || 'RPC error');
-      return j.result;
+    const cdEl = document.getElementById('countdown');
+    const statusEl = document.getElementById('status');
+    let left = 30;
+    let api;
+
+    function short(v){ return v ? `${v.slice(0,16)}…${v.slice(-8)}` : '-'; }
+
+    async function connect() {
+      if (api) return api;
+      const provider = new WsProvider('wss://rpc.polkadot.io');
+      api = await ApiPromise.create({ provider });
+      await api.isReady;
+      statusEl.textContent = 'Connected';
+      return api;
     }
 
-    function short(v){ return v ? v.slice(0,18)+'…' : '-'; }
+    function findExtrinsicResult(events, extrinsicIndex) {
+      const related = events.filter(({ phase }) => phase.isApplyExtrinsic && phase.asApplyExtrinsic.toNumber() === extrinsicIndex);
+      const success = related.some(({ event }) => event.section === 'system' && event.method === 'ExtrinsicSuccess');
+      const failed = related.some(({ event }) => event.section === 'system' && event.method === 'ExtrinsicFailed');
+      if (success) return '<span class="ok">yes</span>';
+      if (failed) return '<span class="bad">no</span>';
+      return 'unknown';
+    }
 
     async function fetchLatest() {
-      const head = await rpc('chain_getFinalizedHead');
-      const block = await rpc('chain_getBlock', [head]);
-      const numHex = block.block.header.number;
-      const num = parseInt(numHex,16);
+      const chain = await connect();
+      const hash = await chain.rpc.chain.getFinalizedHead();
+      const signedBlock = await chain.rpc.chain.getBlock(hash);
+      const at = await chain.at(hash);
+      const allEvents = await at.query.system.events();
 
-      document.getElementById('blockNumber').textContent = `#${num}`;
-      document.getElementById('blockHash').textContent = head;
-      document.getElementById('parentHash').textContent = block.block.header.parentHash;
+      const header = signedBlock.block.header;
+      const blockNo = header.number.toNumber();
+      document.getElementById('blockNumber').textContent = `#${blockNo}`;
+      document.getElementById('blockHash').textContent = hash.toString();
+      document.getElementById('parentHash').textContent = header.parentHash.toString();
       document.getElementById('updated').textContent = new Date().toLocaleString();
 
-      const ext = block.block.extrinsics || [];
-      document.getElementById('txCount').textContent = `${ext.length} items`;
-      const rows = document.getElementById('rows');
+      const extrinsics = signedBlock.block.extrinsics;
+      document.getElementById('txCount').textContent = `${extrinsics.length} items`;
 
-      if (!ext.length) {
+      const rows = document.getElementById('rows');
+      if (!extrinsics.length) {
         rows.innerHTML = '<tr><td colspan="5" class="muted">No extrinsics in this block.</td></tr>';
         return;
       }
 
-      rows.innerHTML = ext.map((hex, i) => {
-        const guess = hex.slice(0, 20);
-        return `<tr><td>${i}</td><td class="muted">(encoded)</td><td class="muted">${guess}…</td><td class="muted">-</td><td>unknown</td></tr>`;
+      rows.innerHTML = extrinsics.map((ex, i) => {
+        const section = ex.method.section;
+        const method = ex.method.method;
+        const signer = ex.isSigned ? short(ex.signer.toString()) : '-';
+        const success = findExtrinsicResult(allEvents, i);
+        return `<tr><td>${i}</td><td>${section}</td><td>${method}</td><td class="muted">${signer}</td><td>${success}</td></tr>`;
       }).join('');
     }
 
-    async function refreshLoop(){
-      try { await fetchLatest(); } catch(e){ document.getElementById('rows').innerHTML = `<tr><td colspan="5" class='muted'>Error: ${e.message}</td></tr>`; }
+    async function refreshLoop() {
+      try {
+        statusEl.textContent = 'Updating...';
+        await fetchLatest();
+        statusEl.textContent = 'Connected';
+      } catch (e) {
+        statusEl.textContent = `Error: ${e.message}`;
+        document.getElementById('rows').innerHTML = `<tr><td colspan='5' class='muted'>${e.message}</td></tr>`;
+      }
       left = 30;
     }
 
-    setInterval(()=>{
+    setInterval(() => {
       left -= 1;
-      if(left <= 0){ refreshLoop(); left = 30; }
-      cdEl.textContent = String(left);
+      if (left <= 0) refreshLoop();
+      cdEl.textContent = String(Math.max(left, 0));
     }, 1000);
 
-    document.getElementById('themeBtn').addEventListener('click', ()=>{
+    document.getElementById('themeBtn').addEventListener('click', () => {
       const html = document.documentElement;
       html.setAttribute('data-theme', html.getAttribute('data-theme') === 'dark' ? 'light' : 'dark');
     });
